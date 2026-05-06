@@ -24,5 +24,3 @@ The installer is created at:
 ```text
 installer\OFAC-Automation-Setup.exe
 ```
-
-Build outputs, local lists, PDFs, virtual environments, and signing files are ignored by git.
