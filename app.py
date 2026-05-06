@@ -44,6 +44,8 @@ FONT_BODY = ("Aptos", 14)
 FONT_SMALL = ("Aptos", 12)
 FONT_TITLE = ("Aptos Display", 30, "bold")
 FONT_SECTION = ("Aptos Display", 18, "bold")
+APP_USER_MODEL_ID = "Internal.OFACAutomation"
+WINDOW_ICON_NAME = "OFAC.ico"
 
 
 class ResultCard(ctk.CTkFrame):
@@ -150,6 +152,7 @@ class OfacAutomationApp(ctk.CTk):
         super().__init__()
 
         self.title("OFAC Automation")
+        self.set_window_icon()
         self.geometry("1180x760")
         self.minsize(1060, 680)
 
@@ -173,6 +176,16 @@ class OfacAutomationApp(ctk.CTk):
         self.create_widgets()
         self.after(100, self.process_messages)
         self.protocol("WM_DELETE_WINDOW", self.handle_close)
+
+    def set_window_icon(self) -> None:
+        icon_path = get_resource_path(WINDOW_ICON_NAME)
+        if not icon_path.exists():
+            return
+
+        try:
+            self.iconbitmap(default=str(icon_path))
+        except tk.TclError:
+            pass
 
     def create_widgets(self) -> None:
         self.grid_columnconfigure(0, weight=1)
@@ -662,6 +675,17 @@ def get_app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def get_resource_path(name: str) -> Path:
+    if getattr(sys, "frozen", False):
+        bundle_dir = Path(getattr(sys, "_MEIPASS", get_app_dir()))
+        bundled_path = bundle_dir / name
+        if bundled_path.exists():
+            return bundled_path
+        return get_app_dir() / name
+
+    return Path(__file__).resolve().parent / name
+
+
 def enable_high_dpi() -> None:
     if sys.platform != "win32":
         return
@@ -675,8 +699,19 @@ def enable_high_dpi() -> None:
             pass
 
 
+def set_windows_app_user_model_id() -> None:
+    if sys.platform != "win32":
+        return
+
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
+
+
 def main() -> None:
     enable_high_dpi()
+    set_windows_app_user_model_id()
     ctk.set_appearance_mode("light")
     ctk.set_widget_scaling(1.0)
     ctk.set_window_scaling(1.0)

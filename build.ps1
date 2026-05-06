@@ -64,6 +64,7 @@ $PyInstallerArgs = @(
     "--windowed",
     "--name", "OFAC Automation",
     "--icon", $IconPath,
+    "--add-data", "${IconPath};.",
     "--collect-all", "customtkinter",
     "--collect-all", "playwright",
     "--workpath", $WorkPath,
