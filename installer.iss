@@ -1,5 +1,5 @@
 #define AppName "OFAC Automation"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppExeName "OFAC Automation.exe"
 
 [Setup]

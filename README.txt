@@ -6,8 +6,9 @@ How to use it
 1. Open OFAC Automation.
 2. Type names into the Names box, or click Import to load a TXT/CSV file.
 3. Click Run Check.
-4. Use Download on any result row to choose where to keep that PDF.
+4. Click Cancel Check to stop and keep the results completed so far.
+5. Use Download on a result row or Download All to keep the PDFs.
 
 PDFs
 ----
-Each scan creates a PDF record automatically. Download copies wherever you need them from the result rows.
+The app downloads the OFAC SDN and Consolidated Non-SDN lists once per run and checks names and aliases locally. Report PDFs show the matching method and list publication dates. Download any PDFs you need before starting a new check or closing the app.

@@ -6,8 +6,9 @@ import queue
 import shutil
 import sys
 import threading
-from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from time import monotonic
 from tkinter import filedialog, messagebox
 from typing import Callable
 import tkinter as tk
@@ -16,10 +17,11 @@ import customtkinter as ctk
 
 from ofac_checker import (
     OfacResult,
-    default_pdf_name,
     load_names_from_file,
     parse_names,
     search_ofac_names,
+    staged_pdf_path,
+    unique_pdf_path,
 )
 
 
@@ -46,16 +48,17 @@ FONT_TITLE = ("Aptos Display", 30, "bold")
 FONT_SECTION = ("Aptos Display", 18, "bold")
 APP_USER_MODEL_ID = "Internal.OFACAutomation"
 WINDOW_ICON_NAME = "OFAC.ico"
+RESULTS_PER_PAGE = 25
 
 
 class ResultCard(ctk.CTkFrame):
     def __init__(
         self,
         master: ctk.CTkBaseClass,
-        item_id: str,
+        result_index: int,
         result: OfacResult,
-        on_save: Callable[[str], None],
-        on_open: Callable[[str], None],
+        on_save: Callable[[int], None],
+        on_open: Callable[[int], None],
     ) -> None:
         super().__init__(
             master,
@@ -65,10 +68,7 @@ class ResultCard(ctk.CTkFrame):
             border_color=COLORS["line"],
         )
 
-        self.item_id = item_id
         self.result = result
-        self.on_save = on_save
-        self.on_open = on_open
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=0)
@@ -83,16 +83,20 @@ class ResultCard(ctk.CTkFrame):
             font=("Aptos", 15, "bold"),
             text_color=COLORS["ink"],
             anchor="w",
+            justify="left",
+            wraplength=330,
         )
         self.name_label.grid(row=0, column=0, sticky="ew")
 
-        detail = result.result_text or result.error or "No result text"
+        detail = "\n".join(text for text in (result.result_text, result.error) if text)
         self.detail_label = ctk.CTkLabel(
             left,
             text=detail,
             font=FONT_SMALL,
             text_color=COLORS["muted"],
             anchor="w",
+            justify="left",
+            wraplength=330,
         )
         self.detail_label.grid(row=1, column=0, sticky="ew", pady=(3, 0))
 
@@ -101,7 +105,7 @@ class ResultCard(ctk.CTkFrame):
 
         self.status_label = ctk.CTkLabel(
             right,
-            text=result.status,
+            text=result.display_status,
             font=("Aptos", 11, "bold"),
             text_color=self.status_color(),
             fg_color="transparent",
@@ -120,7 +124,7 @@ class ResultCard(ctk.CTkFrame):
             corner_radius=10,
             fg_color=COLORS["accent"],
             hover_color=COLORS["accent_hover"],
-            command=lambda: self.on_save(self.item_id),
+            command=lambda: on_save(result_index),
             state=button_state,
         )
         self.save_button.grid(row=1, column=0, padx=(0, 6))
@@ -134,7 +138,7 @@ class ResultCard(ctk.CTkFrame):
             fg_color=COLORS["quiet_button"],
             hover_color=COLORS["quiet_hover"],
             text_color=COLORS["ink"],
-            command=lambda: self.on_open(self.item_id),
+            command=lambda: on_open(result_index),
             state=button_state,
         )
         self.open_button.grid(row=1, column=1)
@@ -157,17 +161,16 @@ class OfacAutomationApp(ctk.CTk):
         self.minsize(1060, 680)
 
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.worker: threading.Thread | None = None
+        self.cancel_event = threading.Event()
         self.running = False
 
-        self.results_by_id: dict[str, OfacResult] = {}
-        self.result_cards: dict[str, ResultCard] = {}
-        self.result_counter = 0
+        self.results: list[OfacResult] = []
+        self.result_cards: list[ResultCard] = []
+        self.result_page = 0
         self.last_save_dir = get_default_output_dir()
         self.report_root = get_internal_report_dir()
-        self.current_report_dir: Path | None = None
+        self.report_folder: TemporaryDirectory[str] | None = None
 
-        cleanup_report_root(self.report_root)
         self.status_var = tk.StringVar(value="Ready")
         self.summary_var = tk.StringVar(value="0 checked")
         self.name_count_var = tk.StringVar(value="0 names")
@@ -223,6 +226,20 @@ class OfacAutomationApp(ctk.CTk):
             command=self.start_search,
         )
         self.run_button.grid(row=0, column=1, rowspan=2, sticky="e")
+
+        self.cancel_button = ctk.CTkButton(
+            header,
+            text="Cancel Check",
+            width=124,
+            height=44,
+            corner_radius=16,
+            fg_color=COLORS["quiet_button"],
+            hover_color=COLORS["quiet_hover"],
+            text_color=COLORS["ink"],
+            command=self.cancel_search,
+            state="disabled",
+        )
+        self.cancel_button.grid(row=0, column=2, rowspan=2, padx=(8, 0))
 
         content = ctk.CTkFrame(self, fg_color="transparent")
         content.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 18))
@@ -370,6 +387,20 @@ class OfacAutomationApp(ctk.CTk):
         )
         self.save_all_button.grid(row=0, column=0, padx=(0, 8))
 
+        self.page_actions = ctk.CTkFrame(actions, fg_color="transparent")
+        self.page_actions.grid(row=0, column=1, sticky="e")
+        self.previous_page_button = ctk.CTkButton(
+            self.page_actions, text="Previous", width=76, command=lambda: self.change_result_page(-1)
+        )
+        self.previous_page_button.grid(row=0, column=0)
+        self.page_label = ctk.CTkLabel(self.page_actions, font=FONT_SMALL, text_color=COLORS["muted"])
+        self.page_label.grid(row=0, column=1, padx=10)
+        self.next_page_button = ctk.CTkButton(
+            self.page_actions, text="Next", width=64, command=lambda: self.change_result_page(1)
+        )
+        self.next_page_button.grid(row=0, column=2)
+        self.refresh_result_pages()
+
         self.results_list = ctk.CTkScrollableFrame(
             panel,
             fg_color=COLORS["surface_alt"],
@@ -463,23 +494,35 @@ class OfacAutomationApp(ctk.CTk):
             messagebox.showwarning("No names", "Add at least one name.")
             return
 
-        self.clear_results()
-        cleanup_report_root(self.report_root)
-        self.current_report_dir = self.report_root / datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.current_report_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.report_root.mkdir(parents=True, exist_ok=True)
+            folder = TemporaryDirectory(prefix="run-", dir=self.report_root, ignore_cleanup_errors=True)
+        except OSError as exc:
+            messagebox.showerror("Could not start check", str(exc))
+            return
 
+        self.clear_results()
+        if self.report_folder is not None:
+            self.report_folder.cleanup()
+        self.report_folder = folder
+        self.cancel_event.clear()
         self.progress_total = len(companies)
         self.progress_done = 0
         self.progress.set(0)
-        self.status_var.set("Searching OFAC...")
+        self.status_var.set("Starting OFAC check…")
         self.set_running(True)
 
-        self.worker = threading.Thread(
+        threading.Thread(
             target=self.search_worker,
-            args=(companies, self.current_report_dir),
+            args=(companies, Path(folder.name)),
             daemon=True,
-        )
-        self.worker.start()
+        ).start()
+
+    def cancel_search(self) -> None:
+        if self.running:
+            self.cancel_event.set()
+            self.cancel_button.configure(state="disabled")
+            self.status_var.set("Cancelling…")
 
     def search_worker(self, companies: list[str], report_dir: Path) -> None:
         try:
@@ -488,58 +531,86 @@ class OfacAutomationApp(ctk.CTk):
                 progress=lambda message: self.messages.put(("status", message)),
                 result_callback=lambda result: self.messages.put(("result", result)),
                 report_dir=report_dir,
+                cancel_event=self.cancel_event,
             )
             self.messages.put(("search_done", None))
         except Exception as exc:
             self.messages.put(("error", str(exc)))
 
     def process_messages(self) -> None:
-        while True:
+        deadline = monotonic() + 0.025
+        received_results = False
+        while monotonic() < deadline:
             try:
                 kind, payload = self.messages.get_nowait()
             except queue.Empty:
                 break
 
             if kind == "status":
-                self.status_var.set(str(payload))
+                if not self.cancel_event.is_set():
+                    self.status_var.set(str(payload))
             elif kind == "result":
                 self.add_result(payload)
                 self.increment_progress()
+                received_results = True
             elif kind == "search_done":
                 self.set_running(False)
-                self.progress.set(1)
-                self.status_var.set("Complete")
-                self.refresh_summary()
+                if self.progress_done < self.progress_total:
+                    self.status_var.set(f"Cancelled after {self.progress_done} of {self.progress_total}")
+                else:
+                    errors = any(result.error for result in self.results)
+                    self.status_var.set("Complete with errors" if errors else "Complete")
             elif kind == "error":
                 self.set_running(False)
                 self.status_var.set("Stopped")
                 messagebox.showerror("OFAC Automation", str(payload))
 
-        self.after(100, self.process_messages)
+        if received_results:
+            self.refresh_summary()
+            self.refresh_result_pages()
+        self.after(50, self.process_messages)
 
     def add_result(self, result: OfacResult) -> None:
-        if self.empty_state.winfo_exists():
+        index = len(self.results)
+        if index == 0:
             self.empty_state.grid_forget()
+        self.results.append(result)
+        if index // RESULTS_PER_PAGE == self.result_page:
+            self.show_result_card(index)
 
-        item_id = f"result-{self.result_counter}"
-        self.result_counter += 1
-
+    def show_result_card(self, index: int) -> None:
         card = ResultCard(
             self.results_list,
-            item_id,
-            result,
+            index,
+            self.results[index],
             on_save=self.save_result_pdf,
             on_open=self.open_result_pdf,
         )
-        card.grid(row=len(self.result_cards), column=0, sticky="ew", padx=10, pady=(10, 0))
+        card.grid(row=index % RESULTS_PER_PAGE, column=0, sticky="ew", padx=10, pady=(10, 0))
+        self.result_cards.append(card)
 
-        self.results_by_id[item_id] = result
-        self.result_cards[item_id] = card
-        self.refresh_summary()
-        self.refresh_actions()
+    def change_result_page(self, offset: int) -> None:
+        self.result_page += offset
+        self.clear_result_cards()
+        first = self.result_page * RESULTS_PER_PAGE
+        for index in range(first, min(first + RESULTS_PER_PAGE, len(self.results))):
+            self.show_result_card(index)
+        self.results_list._parent_canvas.yview_moveto(0)
+        self.refresh_result_pages()
 
-    def save_result_pdf(self, item_id: str) -> None:
-        result = self.results_by_id[item_id]
+    def refresh_result_pages(self) -> None:
+        pages = (len(self.results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
+        if pages < 2:
+            self.page_actions.grid_remove()
+            return
+
+        self.page_actions.grid()
+        self.page_label.configure(text=f"Page {self.result_page + 1} of {pages}")
+        self.previous_page_button.configure(state="normal" if self.result_page > 0 else "disabled")
+        self.next_page_button.configure(state="normal" if self.result_page + 1 < pages else "disabled")
+
+    def save_result_pdf(self, index: int) -> None:
+        result = self.results[index]
         if not result.pdf_path or not result.pdf_path.exists():
             messagebox.showwarning("No PDF", "Run the check again to recreate this PDF.")
             return
@@ -548,7 +619,7 @@ class OfacAutomationApp(ctk.CTk):
         path = filedialog.asksaveasfilename(
             title="Save OFAC PDF",
             initialdir=str(initial_dir),
-            initialfile=default_pdf_name(result.company),
+            initialfile=result.pdf_path.name,
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf")],
         )
@@ -556,13 +627,17 @@ class OfacAutomationApp(ctk.CTk):
             return
 
         destination = Path(path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(result.pdf_path, destination)
+        try:
+            with staged_pdf_path(destination) as temporary_path:
+                shutil.copy2(result.pdf_path, temporary_path)
+        except OSError as exc:
+            messagebox.showerror("Download failed", str(exc))
+            return
         self.last_save_dir = destination.parent
         self.status_var.set(f"Saved {destination.name}")
 
     def save_all_pdfs(self) -> None:
-        saveable = [result for result in self.results_by_id.values() if result.pdf_path and result.pdf_path.exists()]
+        saveable = [result.pdf_path for result in self.results if result.pdf_path and result.pdf_path.exists()]
         if not saveable:
             messagebox.showwarning("No PDFs", "Run a check before saving PDFs.")
             return
@@ -575,47 +650,54 @@ class OfacAutomationApp(ctk.CTk):
             return
 
         folder_path = Path(folder)
-        folder_path.mkdir(parents=True, exist_ok=True)
-
-        for result in saveable:
-            shutil.copy2(result.pdf_path, folder_path / default_pdf_name(result.company))
+        saved = 0
+        try:
+            for path in saveable:
+                with staged_pdf_path(unique_pdf_path(folder_path / path.name)) as temporary_path:
+                    shutil.copy2(path, temporary_path)
+                saved += 1
+        except OSError as exc:
+            messagebox.showerror("Download stopped", f"Saved {saved} of {len(saveable)} PDFs.\n{exc}")
+            return
 
         self.last_save_dir = folder_path
-        self.status_var.set(f"Saved {len(saveable)} PDFs")
+        self.status_var.set(f"Saved {saved} PDFs")
 
-    def open_result_pdf(self, item_id: str) -> None:
-        result = self.results_by_id[item_id]
+    def open_result_pdf(self, index: int) -> None:
+        result = self.results[index]
         if not result.pdf_path or not result.pdf_path.exists():
             return
         os.startfile(result.pdf_path)
 
     def clear_results(self) -> None:
-        for card in self.result_cards.values():
-            card.destroy()
-
-        self.results_by_id.clear()
-        self.result_cards.clear()
-        self.result_counter = 0
+        self.clear_result_cards()
+        self.results.clear()
+        self.result_page = 0
 
         self.empty_state.grid(row=0, column=0, pady=36)
+        self.results_list._parent_canvas.yview_moveto(0)
         self.progress.set(0)
         self.refresh_summary()
         self.refresh_actions()
+        self.refresh_result_pages()
+
+    def clear_result_cards(self) -> None:
+        for card in self.result_cards:
+            card.destroy()
+        self.result_cards.clear()
 
     def refresh_summary(self) -> None:
-        results = list(self.results_by_id.values())
-        review = sum(1 for result in results if result.status == "Review needed")
-        errors = sum(1 for result in results if result.error)
-
-        if not results:
+        if not self.results:
             self.summary_var.set("0 checked")
             return
 
-        self.summary_var.set(f"{len(results)} checked   {review} review   {errors} errors")
+        review = sum(1 for result in self.results if result.status == "Review needed")
+        errors = sum(1 for result in self.results if result.error)
+        self.summary_var.set(f"{len(self.results)} processed   {review} review   {errors} errors")
 
     def refresh_actions(self) -> None:
-        has_pdf = any(result.pdf_path and result.pdf_path.exists() for result in self.results_by_id.values())
-        state = "normal" if has_pdf and not self.running else "disabled"
+        has_pdf = not self.running and any(result.pdf_path and result.pdf_path.exists() for result in self.results)
+        state = "normal" if has_pdf else "disabled"
         self.save_all_button.configure(state=state)
 
     def increment_progress(self) -> None:
@@ -628,15 +710,18 @@ class OfacAutomationApp(ctk.CTk):
         state = "disabled" if running else "normal"
 
         self.run_button.configure(state=state)
+        self.cancel_button.configure(state="normal" if running else "disabled")
         self.import_button.configure(state=state)
         self.clear_names_button.configure(state=state)
+        self.names_text.configure(state=state)
         self.refresh_actions()
 
     def handle_close(self) -> None:
         if self.running:
-            messagebox.showinfo("Still running", "Please wait for the current check to finish.")
+            messagebox.showinfo("Still running", "Use Cancel Check to stop the current check before closing.")
             return
-        cleanup_report_root(self.report_root)
+        if self.report_folder is not None:
+            self.report_folder.cleanup()
         self.destroy()
 
 
@@ -653,20 +738,6 @@ def get_internal_report_dir() -> Path:
         if local_app_data:
             return Path(local_app_data) / "OFAC Automation" / "Reports"
     return get_app_dir() / "Reports"
-
-
-def cleanup_report_root(report_root: Path) -> None:
-    if not report_root.exists():
-        return
-
-    for child in report_root.iterdir():
-        try:
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-        except OSError:
-            pass
 
 
 def get_app_dir() -> Path:
