@@ -781,6 +781,9 @@ def set_windows_app_user_model_id() -> None:
 
 
 def main() -> None:
+    if getattr(sys, "frozen", False):
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+
     enable_high_dpi()
     set_windows_app_user_model_id()
     ctk.set_appearance_mode("light")
