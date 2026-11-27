@@ -17,6 +17,7 @@ import customtkinter as ctk
 
 from ofac_checker import (
     OfacResult,
+    SearchPacing,
     load_names_from_file,
     parse_names,
     search_ofac_names,
@@ -162,7 +163,10 @@ class OfacAutomationApp(ctk.CTk):
 
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
         self.cancel_event = threading.Event()
+        self.search_pacing = SearchPacing()
         self.running = False
+        self.batch_names: list[str] = []
+        self.progress_done = 0
 
         self.results: list[OfacResult] = []
         self.result_cards: list[ResultCard] = []
@@ -227,6 +231,19 @@ class OfacAutomationApp(ctk.CTk):
         )
         self.run_button.grid(row=0, column=1, rowspan=2, sticky="e")
 
+        self.resume_button = ctk.CTkButton(
+            header,
+            text="Resume Check",
+            width=124,
+            height=44,
+            corner_radius=16,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            command=self.run_remaining_search,
+        )
+        self.resume_button.grid(row=0, column=2, rowspan=2, padx=(8, 0))
+        self.resume_button.grid_remove()
+
         self.cancel_button = ctk.CTkButton(
             header,
             text="Cancel Check",
@@ -239,7 +256,7 @@ class OfacAutomationApp(ctk.CTk):
             command=self.cancel_search,
             state="disabled",
         )
-        self.cancel_button.grid(row=0, column=2, rowspan=2, padx=(8, 0))
+        self.cancel_button.grid(row=0, column=3, rowspan=2, padx=(8, 0))
 
         content = ctk.CTkFrame(self, fg_color="transparent")
         content.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 18))
@@ -505,16 +522,24 @@ class OfacAutomationApp(ctk.CTk):
         if self.report_folder is not None:
             self.report_folder.cleanup()
         self.report_folder = folder
-        self.cancel_event.clear()
-        self.progress_total = len(companies)
+        self.batch_names = companies
         self.progress_done = 0
-        self.progress.set(0)
+        self.run_remaining_search()
+
+    def run_remaining_search(self) -> None:
+        if self.running or self.report_folder is None:
+            return
+        remaining = self.batch_names[self.progress_done:]
+        if not remaining:
+            return
+
+        self.cancel_event.clear()
         self.status_var.set("Starting OFAC check…")
         self.set_running(True)
 
         threading.Thread(
             target=self.search_worker,
-            args=(companies, Path(folder.name)),
+            args=(remaining, Path(self.report_folder.name)),
             daemon=True,
         ).start()
 
@@ -532,6 +557,7 @@ class OfacAutomationApp(ctk.CTk):
                 result_callback=lambda result: self.messages.put(("result", result)),
                 report_dir=report_dir,
                 cancel_event=self.cancel_event,
+                pacing=self.search_pacing,
             )
             self.messages.put(("search_done", None))
         except Exception as exc:
@@ -555,15 +581,15 @@ class OfacAutomationApp(ctk.CTk):
                 received_results = True
             elif kind == "search_done":
                 self.set_running(False)
-                if self.progress_done < self.progress_total:
-                    self.status_var.set(f"Cancelled after {self.progress_done} of {self.progress_total}")
+                if self.progress_done < len(self.batch_names):
+                    self.status_var.set(f"Cancelled after {self.progress_done} of {len(self.batch_names)}")
                 else:
                     errors = any(result.error for result in self.results)
                     self.status_var.set("Complete with errors" if errors else "Complete")
             elif kind == "error":
                 self.set_running(False)
-                self.status_var.set("Stopped")
-                messagebox.showerror("OFAC Automation", str(payload))
+                self.status_var.set(f"Paused after {self.progress_done} of {len(self.batch_names)}")
+                messagebox.showerror("OFAC check paused", f"{payload}\n\nUse Resume Check to continue.")
 
         if received_results:
             self.refresh_summary()
@@ -702,8 +728,7 @@ class OfacAutomationApp(ctk.CTk):
 
     def increment_progress(self) -> None:
         self.progress_done += 1
-        if self.progress_total:
-            self.progress.set(min(self.progress_done / self.progress_total, 1))
+        self.progress.set(min(self.progress_done / len(self.batch_names), 1))
 
     def set_running(self, running: bool) -> None:
         self.running = running
@@ -711,6 +736,10 @@ class OfacAutomationApp(ctk.CTk):
 
         self.run_button.configure(state=state)
         self.cancel_button.configure(state="normal" if running else "disabled")
+        if not running and self.progress_done < len(self.batch_names):
+            self.resume_button.grid()
+        else:
+            self.resume_button.grid_remove()
         self.import_button.configure(state=state)
         self.clear_names_button.configure(state=state)
         self.names_text.configure(state=state)
